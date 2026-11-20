@@ -22,7 +22,7 @@ import {
   gearToothPitch,
 } from "@/lib/gearGeometry";
 import { displayStepFromMillimeters, displayToMillimeters, formatMeasurementNumber, lengthDisplayUnit, millimetersToDisplay, parseMeasurementInput } from "@/lib/measurementUnits";
-import { resizedShapeSize, shapeDepth, shapeHasTaper, shapeOverallFootprintDimensions, shapeTaperDimensions, shapeWidth } from "@/lib/workplaneShapes";
+import { cleanNearZero, cleanRotationDegrees, resizedShapeSize, shapeDepth, shapeHasTaper, shapeOverallFootprintDimensions, shapeTaperDimensions, shapeWidth } from "@/lib/workplaneShapes";
 import { normalizeSketchRevolveSettings } from "@/lib/sketchRevolve";
 import { MAX_HIGH_RESOLUTION_SIDES } from "@/lib/workplaneSettings";
 import type { GearType, GridSize, MeasurementAccuracy, WorkplaneShape, WorkplaneWorkspaceSettings } from "@/types/sketchforge";
@@ -73,6 +73,10 @@ type RangePropertyConfig = {
   min: number;
   max: number;
   step?: number;
+  /** Overrides label-based unit detection. */
+  unit?: "length" | "degrees";
+  /** Typed values may go outside [min, max]; the slider still uses that range. */
+  unbounded?: boolean;
   onChange: (value: number) => void;
 };
 
@@ -92,11 +96,63 @@ type SelectPropertyConfig = {
 };
 
 type ShapePropertyConfig = RangePropertyConfig | TextPropertyConfig | SelectPropertyConfig;
-export type ShapeInspectorUpdateOptions = { resizeAxis?: "width" | "depth" | "height" };
+export type ShapeInspectorUpdateOptions = {
+  resizeAxis?: "width" | "depth" | "height";
+  /** Apply the patch as-is (no bottom/edge anchoring), e.g. for explicit position edits. */
+  exactTransform?: boolean;
+};
 type ShapeInspectorUpdate = (patch: Partial<WorkplaneShape>, options?: ShapeInspectorUpdateOptions) => void;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+const MIN_POSITION_ELEVATION = -180;
+const MAX_POSITION_ELEVATION = 220;
+
+/** Shown as -180..180 so the slider centers on 0; stored as 0..360. */
+function signedDegrees(value: number | undefined) {
+  const normalized = cleanRotationDegrees(value ?? 0);
+  return normalized > 180 ? normalized - 360 : normalized;
+}
+
+// The inspector uses a Z-up CAD convention: X = left/right, Y = front to back
+// (internal -z), Z = up (internal elevation). Handedness is preserved, so rotation
+// about Z is the stored Y rotation and rotation about Y is -rotationZ.
+function getPositionProperties(shape: WorkplaneShape, onUpdate: ShapeInspectorUpdate, workspace: WorkplaneWorkspaceSettings): RangePropertyConfig[] {
+  const halfWidth = Math.max(10, workspace.width / 2);
+  const halfDepth = Math.max(10, workspace.depth / 2);
+  const setPosition = (patch: Partial<WorkplaneShape>) => onUpdate(patch, { exactTransform: true });
+  return [
+    { label: "X", unit: "length", unbounded: true, value: shape.x, min: -halfWidth, max: halfWidth, onChange: (x) => setPosition({ x: cleanNearZero(x, 0.0005) }) },
+    { label: "Y", unit: "length", unbounded: true, value: -shape.z, min: -halfDepth, max: halfDepth, onChange: (y) => setPosition({ z: cleanNearZero(-y, 0.0005) }) },
+    {
+      label: "Z",
+      unit: "length",
+      value: shape.elevation ?? 0,
+      min: MIN_POSITION_ELEVATION,
+      max: MAX_POSITION_ELEVATION,
+      onChange: (elevation) => setPosition({ elevation: cleanNearZero(clamp(elevation, MIN_POSITION_ELEVATION, MAX_POSITION_ELEVATION), 0.0005) }),
+    },
+  ];
+}
+
+function getRotationProperties(shape: WorkplaneShape, onUpdate: ShapeInspectorUpdate): RangePropertyConfig[] {
+  const rotationRow = (label: string, value: number, toPatch: (degrees: number) => Partial<WorkplaneShape>): RangePropertyConfig => ({
+    label,
+    unit: "degrees",
+    unbounded: true,
+    value,
+    min: -180,
+    max: 180,
+    step: 1,
+    onChange: (degrees) => onUpdate(toPatch(degrees)),
+  });
+  return [
+    rotationRow("X", signedDegrees(shape.rotationX), (degrees) => ({ rotationX: cleanRotationDegrees(degrees) })),
+    rotationRow("Y", signedDegrees(-(shape.rotationZ ?? 0)), (degrees) => ({ rotationZ: cleanRotationDegrees(-degrees) })),
+    rotationRow("Z", signedDegrees(shape.rotation), (degrees) => ({ rotation: cleanRotationDegrees(degrees) })),
+  ];
 }
 
 function formatPropertyNumber(value: number, accuracy: MeasurementAccuracy, step: number) {
@@ -434,10 +490,14 @@ export function ShapeInspector({
       onChange: (taperBottomWidth) => onUpdate({ taperBottomWidth, taperBottomDepth: taper.bottomDepth, taperBottomScale: undefined }),
     },
   ];
+  const positionProperties = getPositionProperties(shape, onUpdate, workspace);
+  const rotationProperties = getRotationProperties(shape, onUpdate);
   const isSketchRevolve = shape.sketchOperation === "revolve" || Boolean(shape.sketchRevolve);
   const inspectorRef = useRef<HTMLElement>(null);
   const [propertiesOpen, setPropertiesOpen] = useState(true);
   const [taperOpen, setTaperOpen] = useState(false);
+  const [positionOpen, setPositionOpen] = useState(false);
+  const [rotationOpen, setRotationOpen] = useState(false);
   const [gearTeethOpen, setGearTeethOpen] = useState(true);
   const [gearHelixOpen, setGearHelixOpen] = useState(true);
   const [colorOpen, setColorOpen] = useState(false);
@@ -592,6 +652,40 @@ export function ShapeInspector({
           </div>
         ) : null}
       </div>
+      <div className={`property-card ${positionOpen ? "" : "collapsed"}`}>
+        <button
+          className="property-card-header"
+          type="button"
+          aria-expanded={positionOpen}
+          aria-controls={`position-${shape.id}`}
+          onClick={() => setPositionOpen((open) => !open)}
+        >
+          <span>Position</span>
+          <ChevronUp className={positionOpen ? "" : "collapsed"} size={25} strokeWidth={2.8} />
+        </button>
+        {positionOpen ? (
+          <div className="property-list" id={`position-${shape.id}`}>
+            <ShapePropertyRows properties={positionProperties} workspace={workspace} disabled={locked} onInteractionActiveChange={onInteractionActiveChange} />
+          </div>
+        ) : null}
+      </div>
+      <div className={`property-card ${rotationOpen ? "" : "collapsed"}`}>
+        <button
+          className="property-card-header"
+          type="button"
+          aria-expanded={rotationOpen}
+          aria-controls={`rotation-${shape.id}`}
+          onClick={() => setRotationOpen((open) => !open)}
+        >
+          <span>Rotation</span>
+          <ChevronUp className={rotationOpen ? "" : "collapsed"} size={25} strokeWidth={2.8} />
+        </button>
+        {rotationOpen ? (
+          <div className="property-list" id={`rotation-${shape.id}`}>
+            <ShapePropertyRows properties={rotationProperties} workspace={workspace} disabled={locked} onInteractionActiveChange={onInteractionActiveChange} />
+          </div>
+        ) : null}
+      </div>
       {shape.kind !== "gear" ? (
         <div className={`property-card ${taperOpen ? "" : "collapsed"}`}>
           <button
@@ -724,15 +818,18 @@ function RangeProperty({
   min,
   max,
   step = 0.01,
+  unit: unitKind,
+  unbounded = false,
   workspace,
   disabled,
   onChange,
   onInteractionActiveChange,
 }: RangePropertyConfig & { workspace: WorkplaneWorkspaceSettings; disabled?: boolean; onInteractionActiveChange?: (active: boolean) => void }) {
   const allowsAboveSliderMax = label === "Length" || label === "Width" || label === "Height" || label.endsWith(" Length") || label.endsWith(" Width");
-  const isLength = propertyUsesLengthUnit(label);
+  const isLength = unitKind ? unitKind === "length" : propertyUsesLengthUnit(label);
   const accuracy = workspace.accuracy;
-  const actualValue = Math.max(min, Number.isFinite(value) ? value : min);
+  const finiteValue = Number.isFinite(value) ? value : min;
+  const actualValue = unbounded ? finiteValue : Math.max(min, finiteValue);
   const controlValue = isLength ? millimetersToDisplay(actualValue, workspace) : actualValue;
   const controlMin = isLength ? millimetersToDisplay(min, workspace) : min;
   const controlMax = isLength ? millimetersToDisplay(max, workspace) : max;
@@ -741,13 +838,13 @@ function RangeProperty({
   const position = ((sliderValue - controlMin) / Math.max(Number.EPSILON, controlMax - controlMin)) * 100;
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(formatPropertyNumber(controlValue, accuracy, controlStep));
-  const unit = isLength ? lengthDisplayUnit(workspace).label : null;
+  const unit = isLength ? lengthDisplayUnit(workspace).label : unitKind === "degrees" ? "°" : null;
   const toModelValue = (nextValue: number) => isLength ? displayToMillimeters(nextValue, workspace) : nextValue;
   const commitDraft = () => {
     const next = parseMeasurementInput(draft);
     const finiteNext = Number.isFinite(next) ? next : controlValue;
     const nextModelValue = toModelValue(finiteNext);
-    onChange(allowsAboveSliderMax ? Math.max(min, nextModelValue) : clamp(nextModelValue, min, max));
+    onChange(unbounded ? nextModelValue : allowsAboveSliderMax ? Math.max(min, nextModelValue) : clamp(nextModelValue, min, max));
     setEditing(false);
     onInteractionActiveChange?.(false);
   };

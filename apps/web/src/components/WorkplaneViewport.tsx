@@ -5193,7 +5193,10 @@ export function WorkplaneViewport({
           workspace={workspace}
           onUpdate={(patch, options) => {
             clearMoveDimensions();
-            onUpdateShape(selectedShape.id, patchWithResizeAnchor(selectedShape, patch, options?.resizeAxis, lastResizeAnchorRef.current));
+            onUpdateShape(
+              selectedShape.id,
+              options?.exactTransform ? patch : patchWithResizeAnchor(selectedShape, patch, options?.resizeAxis, lastResizeAnchorRef.current),
+            );
           }}
           onSnapChange={setSnap}
           onSnapOpenChange={setSnapOpen}
